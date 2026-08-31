@@ -1,0 +1,22 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+
+# Julia and editor state
+.julia/
+.vscode/
+.idea/
+*.log
+
+# Generated MCMC artefacts
+output/
+*.jld2
+
+# Restricted source data: keep only the instructions
+data/restricted/*
+!data/restricted/README.md
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
