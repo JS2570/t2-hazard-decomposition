@@ -1,12 +1,14 @@
 # t²: A Metric for Decomposing Hazard
 
-This repository packages the current Model C human-population MCMC workflow used to decompose simulated mortality into intrinsic and extrinsic components. It is a publication-staging repository for the code and its input provenance; generated chains, figures, checkpoints, and reported results are intentionally excluded.
+This repository contains an a generative simulation for predicting the potential proportion of deaths attributed intrinsic and extrinsic components. It is a publication-staging repository for the code and its input provenance; generated chains, figures, checkpoints, and reported results are intentionally excluded.
 
-The runnable analysis is [run_model_c.jl](run_model_c.jl). An exact, byte-preserved copy of the supplied research source is retained at [reference/THE_ONE](reference/THE_ONE), and the runnable file changes only its six machine-specific path declarations. See [docs/provenance.md](docs/provenance.md) for the integrity record.
+The runnable analysis is [run_model_c.jl](run_model_c.jl). The runnable file changes only its six machine-specific path declarations. See [docs/provenance.md](docs/provenance.md) for the integrity record.
 
 ## Status
 
 This is research code under validation, not a validated software release. Read [docs/validation-status.md](docs/validation-status.md) before interpreting or publishing results.
+
+**Notice before running the code**
 
 The default workflow is exceptionally computationally expensive: it performs four MCMC runs of 500,000 iterations, with simulation-based likelihood evaluations using 20 replicates of 20,000 individuals. Do not launch the default analysis merely as an installation test.
 
@@ -30,8 +32,7 @@ The preprocessing and data-acquisition application is deliberately not copied he
 ## Requirements
 
 - Julia 1.10.12
-- Access to authorized Hadza and Aché survivorship workbooks for the complete three-population workflow
-- Sufficient time, memory, and CPU capacity for the requested MCMC settings
+
 
 Instantiate the pinned environment:
 
@@ -61,13 +62,13 @@ julia --project=. scripts/check_inputs.jl
 ## Run
 
 After the input check passes:
+## Scope
 
+This first code release contains only the human single-λ Model C workflow. Chimpanzee, Sweden/Keyfitz, counterfactual, poster-generation, two-segment, and earlier broken saving variants are outside its scope.
 ```bash
 julia --project=. --threads auto run_model_c.jl
 ```
 
 The program writes chains, checkpoint files, summaries, diagnostics, and figures under `output/model_c_revised/`. The entire output tree is ignored by Git.
 
-## Scope
 
-This first code release contains only the human single-λ Model C workflow. Chimpanzee, Sweden/Keyfitz, counterfactual, poster-generation, two-segment, and earlier broken saving variants are outside its scope.
