@@ -1,0 +1,1707 @@
+
+# =============================================================================
+# MODEL C — JOINT ESTIMATION (REVISED v2 — λ RESTORED)
+# WITH NO-PRIORS SENSITIVITY ANALYSIS FULLY INTEGRATED
+# WITH CHECKPOINTING, BURN-IN RECORDING, RESUME, AND ETA
+# =============================================================================
+#
+# CHECKPOINT ADDITIONS (all marked with # CHECKPOINT:):
+#   1. JLD2 dependency for binary checkpoint files
+#   2. checkpoint_interval setting (default 10,000 iterations)
+#   3. save_checkpoint() / load_checkpoint() — sampler state + chains so far
+#   4. save_stage_status() / load_stage_status() — pipeline progress tracking
+#   5. run_model_C now:
+#      - Stores burn-in samples in separate arrays
+#      - Saves JLD2 checkpoint every checkpoint_interval iterations
+#      - Prints ETA based on timing each batch
+#      - Resumes from checkpoint if one exists
+#      - Returns burn-in chains alongside post-burn-in chains
+#   6. plot_diagnostics now shows burn-in trace in grey (left of vertical line)
+#   7. main() checks stage_status.jld2 before each population run
+#
+# ALL FINAL CSV OUTPUTS ARE IDENTICAL TO THE ORIGINAL FILE.
+# The checkpoint files are an addition, not a replacement.
+#
+# =============================================================================
+
+
+# =============================================================================
+# DEPENDENCIES
+# =============================================================================
+
+using Random
+using Statistics
+using Distributions
+using CSV
+using DataFrames
+using XLSX
+using CairoMakie
+using Printf
+using Dates
+using Base.Threads
+using JLD2          # CHECKPOINT: binary checkpoint files
+
+
+# =============================================================================
+# SAFE FLOAT — for Excel data parsing
+# =============================================================================
+
+function safe_float(x::Number)::Float64
+ return Float64(x)
+end
+function safe_float(x::AbstractString)::Float64
+ s = strip(x)
+ val = tryparse(Float64, s)
+ val === nothing && return NaN
+ return val
+end
+function safe_float(x::Missing)::Float64; return NaN; end
+function safe_float(x::Nothing)::Float64; return NaN; end
+function safe_float(x)::Float64
+ try return Float64(x) catch; return NaN end
+end
+
+
+# =============================================================================
+# PART 1: FILE PATHS
+# =============================================================================
+
+const PROJECT_ROOT = @__DIR__
+const LIFE_TABLE_PATH = joinpath(PROJECT_ROOT, "data", "processed", "life_table.csv")
+const COUNTRY_TABLE_PATH = joinpath(PROJECT_ROOT, "data", "processed", "country_table.csv")
+const HADZA_PATH = joinpath(PROJECT_ROOT, "data", "restricted", "Hadza - Blurton Jones data.xlsx")
+const ACHE_PATH = joinpath(PROJECT_ROOT, "data", "restricted", "Ache - Hurtado & Hill.xlsx")
+const OUTPUT_ROOT = joinpath(PROJECT_ROOT, "output", "model_c_revised")
+
+
+# =============================================================================
+# PART 2: SETTINGS
+# =============================================================================
+
+const SETTINGS = (
+
+ n_bins = 11,
+
+ # --- FORWARD SIMULATION ---
+ n_individuals = 20_000,
+ n_reps = 20,
+
+ # --- MCMC ---
+ n_iterations = 500_000,              # CHECKPOINT: increased from 100k
+ burn_in = 50_000,                    # CHECKPOINT: scaled with n_iterations (10%)
+
+ # --- PROPOSAL STEP SIZES ---
+ proposal_sd_log_N0 = 0.7,
+ proposal_sd_log_lam = 0.5,
+ proposal_sd_qe = 0.2,
+
+ # --- N_0 PRIOR ---
+ N0_min = 100,
+ N0_max = 100_000,
+
+ # --- λ PRIOR ---
+ lam_min = 0.0001,
+ lam_max = 0.5,
+
+ # --- SMOOTHING PRIOR ON q_e ---
+ smoothing_strength = 0.05,
+
+ # --- SOFT HG CEILING ---
+ sigma_qe_ceiling = 0.05,
+
+ # --- CHECKPOINT ---                 # CHECKPOINT: new settings
+ checkpoint_interval = 10_000,        # save state every N iterations
+)
+
+
+# =============================================================================
+# PART 3: DATA LOADING
+# =============================================================================
+
+function load_pipeline_population(iso3::String, year::Int)
+ lt = CSV.read(LIFE_TABLE_PATH, DataFrame)
+ mask = (lt.ISO3 .== iso3) .& (lt.Year .== year)
+ pop = sort(lt[mask, :], :Age)
+ nrow(pop) == 0 && error("No data found for $iso3 in $year")
+ ages = pop.Age
+ lx = pop.lx ./ pop.lx[1]
+ @info "Loaded $iso3 $year" n_ages=length(ages)
+ return (ages=ages, lx=lx, label="$iso3 $year")
+end
+
+function load_hadza()
+ raw = DataFrame(XLSX.readtable(HADZA_PATH, 1))
+ rename!(raw, names(raw)[1] => :Age)
+ raw.Age = [safe_float(x) for x in raw.Age]
+ raw.lx = [safe_float(x) for x in raw.lx]
+ valid = .!isnan.(raw.Age) .& .!isnan.(raw.lx)
+ raw = raw[valid, :]
+ sort!(raw, :Age)
+ raw.lx ./= raw.lx[1]
+ @info "Loaded Hadza" n_ages=nrow(raw)
+ return (ages=raw.Age, lx=raw.lx, label="Hadza")
+end
+
+function load_ache()
+ raw = DataFrame(XLSX.readtable(ACHE_PATH, 1))
+ n = nrow(raw)
+ raw.Age = Float64.(collect(0:(n-1)))
+ raw.lx = [safe_float(x) for x in raw.lx]
+ valid = .!isnan.(raw.lx)
+ raw = raw[valid, :]
+ sort!(raw, :Age)
+ raw.lx ./= raw.lx[1]
+ @info "Loaded Ache" n_ages=nrow(raw)
+ return (ages=raw.Age, lx=raw.lx, label="Ache")
+end
+
+
+# =============================================================================
+# PART 4: PROPORTIONAL BINNING
+# =============================================================================
+
+function bin_proportional(ages::AbstractVector, lx::AbstractVector, n_bins::Int)
+ max_age = maximum(ages)
+ bin_edges = [max_age * k / n_bins for k in 0:n_bins]
+
+ observed_lx = [lx[argmin(abs.(ages .- bin_edges[k]))] for k in 1:n_bins]
+
+ observed_qx = zeros(Float64, n_bins)
+ for k in 1:(n_bins - 1)
+ lx_k = observed_lx[k]
+ lx_next = observed_lx[k + 1]
+ observed_qx[k] = lx_k > 0.0 ? (lx_k - lx_next) / lx_k : 1.0
+ end
+ observed_qx[n_bins] = 1.0
+
+ bin_midpoints = [(bin_edges[k] + bin_edges[k+1]) / 2.0 for k in 1:n_bins]
+
+ return (
+ observed_lx = observed_lx,
+ observed_qx = observed_qx,
+ bin_midpoints = bin_midpoints,
+ bin_edges = bin_edges,
+ max_age = max_age,
+ n_bins = n_bins
+ )
+end
+
+
+# =============================================================================
+# PART 5: N PROFILE
+# =============================================================================
+
+function compute_N_profile(N0::Float64, lam::Float64, bin_midpoints::Vector{Float64})
+ return [max(1, round(Int, N0 * exp(-lam * age))) for age in bin_midpoints]
+end
+
+
+# =============================================================================
+# PART 6: FORWARD SIMULATION
+# =============================================================================
+
+function forward_simulation(
+ N_profile :: Vector{Int},
+ q_e :: Vector{Float64},
+ n_bins :: Int,
+ n_individuals:: Int
+)
+ survivors = zeros(Int, n_bins)
+ intrinsic_deaths = zeros(Int, n_bins)
+ extrinsic_deaths = zeros(Int, n_bins)
+
+ for i in 1:n_individuals
+ health = 0.5
+ for bin in 1:n_bins
+ survivors[bin] += 1
+ N_bin = N_profile[bin]
+ health_clamped = clamp(health, 0.0, 0.5)
+ new_health = rand(Binomial(N_bin, health_clamped)) / N_bin
+ health = min(new_health, 0.5)
+
+ if health <= 0.0
+ intrinsic_deaths[bin] += 1
+ break
+ end
+ if health <= q_e[bin]
+ extrinsic_deaths[bin] += 1
+ break
+ end
+ end
+ end
+
+ predicted_lx = survivors ./ n_individuals
+
+ predicted_qx = zeros(Float64, n_bins)
+ for bin in 1:n_bins
+ total_deaths = intrinsic_deaths[bin] + extrinsic_deaths[bin]
+ predicted_qx[bin] = survivors[bin] > 0 ? total_deaths / survivors[bin] : 1.0
+ end
+
+return (
+        predicted_lx     = predicted_lx,
+        predicted_qx     = predicted_qx,
+        intrinsic_deaths = intrinsic_deaths,
+        extrinsic_deaths = extrinsic_deaths,
+        survivors        = survivors
+    )
+
+end
+
+
+# =============================================================================
+# PART 7: LOG-LIKELIHOOD
+# =============================================================================
+
+function log_likelihood(predicted_qx::Vector{Float64}, observed_qx::Vector{Float64})
+ n = length(observed_qx)
+ sse = 0.0
+ for k in 1:n
+ pred = max(predicted_qx[k], 1e-10)
+ obs = max(observed_qx[k], 1e-10)
+ sse += (log(pred) - log(obs))^2
+ end
+ return -n / 2.0 * log(sse / n + 1e-10)
+end
+
+function avg_log_likelihood(
+ N_profile :: Vector{Int},
+ q_e :: Vector{Float64},
+ observed_qx :: Vector{Float64},
+ n_bins :: Int,
+ n_individuals:: Int,
+ n_reps :: Int
+)
+ totals = zeros(n_reps)
+ Threads.@threads for r in 1:n_reps
+ result = forward_simulation(N_profile, q_e, n_bins, n_individuals)
+ totals[r] = log_likelihood(result.predicted_qx, observed_qx)
+ end
+ return mean(totals)
+end
+
+
+# =============================================================================
+# PART 8: LOG-PRIORS
+# =============================================================================
+
+function log_prior_N0(N0::Float64; settings=SETTINGS)
+ (N0 < settings.N0_min || N0 > settings.N0_max) && return -Inf
+ return -log(N0)
+end
+
+function log_prior_lambda(lam::Float64; settings=SETTINGS)
+ (lam < settings.lam_min || lam > settings.lam_max) && return -Inf
+ return -log(lam)
+end
+
+function log_prior_qe(q_e::Vector{Float64};
+ settings=SETTINGS,
+ upper_bounds::Union{Vector{Float64}, Nothing}=nothing)
+
+ any(x -> x < 0.0 || x > 0.5, q_e) && return -Inf
+
+ penalty_smooth = sum((q_e[k] - q_e[k-1])^2 for k in 2:length(q_e))
+
+ penalty_ceiling = 0.0
+ if upper_bounds !== nothing
+ for k in 1:length(q_e)
+ excess = q_e[k] - upper_bounds[k]
+ if excess > 0.0
+ penalty_ceiling += (excess / settings.sigma_qe_ceiling)^2
+ end
+ end
+ end
+
+ return -settings.smoothing_strength * penalty_smooth - 0.5 * penalty_ceiling
+end
+
+
+# =============================================================================
+# PART 9: LOG-POSTERIOR HELPER
+# =============================================================================
+
+function _eval_lpost(ll, N0, lam, qe, use_priors, qe_upper_bounds, settings)
+ if use_priors
+ return ll +
+ log_prior_N0(N0; settings=settings) +
+ log_prior_lambda(lam; settings=settings) +
+ log_prior_qe(qe; settings=settings, upper_bounds=qe_upper_bounds)
+ else
+ (N0 < settings.N0_min || N0 > settings.N0_max) && return -Inf
+ (lam < settings.lam_min || lam > settings.lam_max) && return -Inf
+ any(x -> x < 0.0 || x > 0.5, qe) && return -Inf
+ return ll
+ end
+end
+
+
+# =============================================================================
+# PART 9b: CHECKPOINT INFRASTRUCTURE
+# =============================================================================
+# CHECKPOINT: All new. Saves sampler state + accumulated chains to JLD2.
+# Think of this like a save game — everything needed to resume from exactly
+# where you left off, including the burn-in samples you've already collected.
+
+"""
+    save_checkpoint(path; kwargs...)
+
+Save the full MCMC state to a JLD2 file. Contains:
+- Current sampler position (N₀, λ, q_e, lpost)
+- Iteration counter
+- All chain samples collected so far (burn-in + post-burn-in)
+- Acceptance counters
+- Timing information for ETA
+"""
+function save_checkpoint(path::String;
+ iter::Int,
+ N0_current::Float64,
+ lam_current::Float64,
+ qe_current::Vector{Float64},
+ lpost_current::Float64,
+ ll_current::Float64,
+ # Burn-in chains
+ burnin_N0::Vector{Float64},
+ burnin_lam::Vector{Float64},
+ burnin_qe::Matrix{Float64},
+ burnin_ll::Vector{Float64},
+ burnin_filled::Int,
+ # Post-burn-in chains
+ chain_N0::Vector{Float64},
+ chain_lam::Vector{Float64},
+ chain_qe::Matrix{Float64},
+ chain_ll::Vector{Float64},
+ post_filled::Int,
+ # Acceptance counts
+ n_accepted_N0::Int,
+ n_accepted_lam::Int,
+ n_accepted_qe::Int,
+ # Metadata
+ label::String,
+ elapsed_seconds::Float64)
+
+ jldsave(path;
+  iter = iter,
+  N0_current = N0_current,
+  lam_current = lam_current,
+  qe_current = qe_current,
+  lpost_current = lpost_current,
+  ll_current = ll_current,
+  burnin_N0 = burnin_N0,
+  burnin_lam = burnin_lam,
+  burnin_qe = burnin_qe,
+  burnin_ll = burnin_ll,
+  burnin_filled = burnin_filled,
+  chain_N0 = chain_N0,
+  chain_lam = chain_lam,
+  chain_qe = chain_qe,
+  chain_ll = chain_ll,
+  post_filled = post_filled,
+  n_accepted_N0 = n_accepted_N0,
+  n_accepted_lam = n_accepted_lam,
+  n_accepted_qe = n_accepted_qe,
+  label = label,
+  elapsed_seconds = elapsed_seconds,
+  timestamp = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+ )
+end
+
+"""
+    load_checkpoint(path) → NamedTuple or nothing
+
+Load a checkpoint. Returns nothing if the file doesn't exist or is corrupt.
+"""
+function load_checkpoint(path::String)
+ !isfile(path) && return nothing
+ try
+  data = load(path)
+  @info "Loaded checkpoint" path=path iter=data["iter"] label=data["label"]
+  return data
+ catch e
+  @warn "Corrupt checkpoint file, starting fresh" path=path error=e
+  return nothing
+ end
+end
+
+"""
+    save_stage_status(dir, stage_name, result, qi_t2)
+
+Mark a pipeline stage as complete. Stores the result needed by downstream
+stages (e.g., HG q_e medians that become Japan's ceiling).
+"""
+function save_stage_status(dir::String, stage_name::String, result, qi_t2)
+ status_path = joinpath(dir, "stage_status.jld2")
+
+ # Load existing status or start fresh
+ if isfile(status_path)
+  status = load(status_path)
+ else
+  status = Dict{String, Any}()
+ end
+
+ n_bins = size(result.chain_qe, 2)
+ status[stage_name] = Dict{String, Any}(
+  "completed" => true,
+  "timestamp" => Dates.format(now(), "yyyy-mm-dd HH:MM:SS"),
+  "qe_medians" => [median(result.chain_qe[:, b]) for b in 1:n_bins],
+  "t2_global" => qi_t2.t2_global,
+  "N0_median" => median(result.chain_N0),
+  "lam_median" => median(result.chain_lam),
+ )
+
+ jldsave(status_path; status...)
+ @info "Stage completed and saved" stage=stage_name
+end
+
+"""
+    load_stage_status(dir) → Dict or empty Dict
+
+Read pipeline stage markers.
+"""
+function load_stage_status(dir::String)
+ status_path = joinpath(dir, "stage_status.jld2")
+ !isfile(status_path) && return Dict{String, Any}()
+ try
+  return load(status_path)
+ catch e
+  @warn "Could not read stage status" error=e
+  return Dict{String, Any}()
+ end
+end
+
+"""
+    is_stage_complete(dir, stage_name) → Bool
+"""
+function is_stage_complete(dir::String, stage_name::String)
+ status = load_stage_status(dir)
+ return haskey(status, stage_name) &&
+        isa(status[stage_name], Dict) &&
+        get(status[stage_name], "completed", false)
+end
+
+"""
+    format_eta(seconds) → String
+
+Human-readable ETA string.
+"""
+function format_eta(seconds::Float64)
+ seconds < 0 && return "unknown"
+ h = floor(Int, seconds / 3600)
+ m = floor(Int, (seconds % 3600) / 60)
+ s = floor(Int, seconds % 60)
+ if h > 0
+  return @sprintf("%dh %02dm %02ds", h, m, s)
+ elseif m > 0
+  return @sprintf("%dm %02ds", m, s)
+ else
+  return @sprintf("%ds", s)
+ end
+end
+
+
+# =============================================================================
+# PART 10: MODEL C — MAIN MCMC
+# =============================================================================
+# CHECKPOINT: Now stores burn-in, checkpoints every N iterations, prints ETA,
+#             and can resume from a checkpoint file.
+# All MCMC logic (proposal, acceptance, blocks) is IDENTICAL to the original.
+
+function run_model_C(
+ observed_qx :: Vector{Float64},
+ bin_midpoints :: Vector{Float64},
+ n_bins :: Int;
+ settings = SETTINGS,
+ label :: String = "",
+ qe_upper_bounds :: Union{Vector{Float64}, Nothing} = nothing,
+ use_priors :: Bool = true,
+ checkpoint_dir :: String = OUTPUT_ROOT      # CHECKPOINT: where to save .jld2
+)
+ @info "Starting Model C" label=label use_priors=use_priors n_bins=n_bins
+
+ label_clean = replace(label, " " => "_")
+ checkpoint_path = joinpath(checkpoint_dir, "checkpoint_$(label_clean).jld2")
+ checkpoint_interval = settings.checkpoint_interval
+
+ # -------------------------------------------------------------------------
+ # STORAGE — burn-in AND post-burn-in                   # CHECKPOINT: burn-in added
+ # -------------------------------------------------------------------------
+ burn_in = settings.burn_in
+ n_post = settings.n_iterations - burn_in
+
+ burnin_N0  = zeros(Float64, burn_in)
+ burnin_lam = zeros(Float64, burn_in)
+ burnin_qe  = zeros(Float64, burn_in, n_bins)
+ burnin_ll  = zeros(Float64, burn_in)
+
+ chain_N0  = zeros(Float64, n_post)
+ chain_lam = zeros(Float64, n_post)
+ chain_qe  = zeros(Float64, n_post, n_bins)
+ chain_ll  = zeros(Float64, n_post)
+
+ n_accepted_N0  = 0
+ n_accepted_lam = 0
+ n_accepted_qe  = 0
+
+ # -------------------------------------------------------------------------
+ # INITIALISATION or RESUME                              # CHECKPOINT: resume logic
+ # -------------------------------------------------------------------------
+ start_iter = 1
+ elapsed_prior = 0.0
+ burnin_filled = 0
+ post_filled = 0
+
+ ckpt = load_checkpoint(checkpoint_path)
+ if ckpt !== nothing
+  # Resume from checkpoint
+  start_iter     = ckpt["iter"] + 1
+  N0_current     = ckpt["N0_current"]
+  lam_current    = ckpt["lam_current"]
+  qe_current     = ckpt["qe_current"]
+  lpost_current  = ckpt["lpost_current"]
+  ll_current     = ckpt["ll_current"]
+  n_accepted_N0  = ckpt["n_accepted_N0"]
+  n_accepted_lam = ckpt["n_accepted_lam"]
+  n_accepted_qe  = ckpt["n_accepted_qe"]
+  elapsed_prior  = ckpt["elapsed_seconds"]
+  burnin_filled  = ckpt["burnin_filled"]
+  post_filled    = ckpt["post_filled"]
+
+  # Restore accumulated chains
+  bf = ckpt["burnin_filled"]
+  if bf > 0
+   burnin_N0[1:bf]    = ckpt["burnin_N0"][1:bf]
+   burnin_lam[1:bf]   = ckpt["burnin_lam"][1:bf]
+   burnin_qe[1:bf, :] = ckpt["burnin_qe"][1:bf, :]
+   burnin_ll[1:bf]    = ckpt["burnin_ll"][1:bf]
+  end
+  pf = ckpt["post_filled"]
+  if pf > 0
+   chain_N0[1:pf]    = ckpt["chain_N0"][1:pf]
+   chain_lam[1:pf]   = ckpt["chain_lam"][1:pf]
+   chain_qe[1:pf, :] = ckpt["chain_qe"][1:pf, :]
+   chain_ll[1:pf]    = ckpt["chain_ll"][1:pf]
+  end
+
+  N_profile_current = compute_N_profile(N0_current, lam_current, bin_midpoints)
+
+  remaining = settings.n_iterations - ckpt["iter"]
+  @info @sprintf("Resuming from iteration %d — %d iterations remaining",
+                 ckpt["iter"], remaining)
+ else
+  # Fresh start — geometric midpoints of prior ranges
+  N0_current  = exp((log(settings.N0_min) + log(settings.N0_max)) / 2.0)
+  lam_current = exp((log(settings.lam_min) + log(settings.lam_max)) / 2.0)
+  qe_current  = fill(0.15, n_bins)
+
+  N_profile_current = compute_N_profile(N0_current, lam_current, bin_midpoints)
+
+  ll_current = avg_log_likelihood(N_profile_current, qe_current, observed_qx,
+                                  n_bins, settings.n_individuals, settings.n_reps)
+
+  lpost_current = _eval_lpost(ll_current, N0_current, lam_current, qe_current,
+                              use_priors, qe_upper_bounds, settings)
+ end
+
+ # -------------------------------------------------------------------------
+ # ETA TIMING                                            # CHECKPOINT: ETA
+ # -------------------------------------------------------------------------
+ batch_start_time = time()
+ batch_start_iter = start_iter
+
+ # -------------------------------------------------------------------------
+ # MAIN MCMC LOOP — three blocks (UNCHANGED MCMC logic)
+ # -------------------------------------------------------------------------
+ for iter in start_iter:settings.n_iterations
+
+  # =====================================================================
+  # BLOCK 1: UPDATE N_0
+  # =====================================================================
+  log_N0_proposed = log(N0_current) + randn() * settings.proposal_sd_log_N0
+  N0_proposed = exp(log_N0_proposed)
+
+  N_profile_proposed = compute_N_profile(N0_proposed, lam_current, bin_midpoints)
+  ll_proposed = avg_log_likelihood(N_profile_proposed, qe_current, observed_qx,
+                                   n_bins, settings.n_individuals, settings.n_reps)
+
+  lpost_proposed = _eval_lpost(ll_proposed, N0_proposed, lam_current, qe_current,
+                               use_priors, qe_upper_bounds, settings)
+
+  if log(rand()) < (lpost_proposed - lpost_current)
+   N0_current = N0_proposed
+   N_profile_current = N_profile_proposed
+   ll_current = ll_proposed
+   lpost_current = lpost_proposed
+   n_accepted_N0 += 1
+  end
+
+  # =====================================================================
+  # BLOCK 2: UPDATE λ
+  # =====================================================================
+  log_lam_proposed = log(lam_current) + randn() * settings.proposal_sd_log_lam
+  lam_proposed = exp(log_lam_proposed)
+
+  N_profile_proposed = compute_N_profile(N0_current, lam_proposed, bin_midpoints)
+  ll_proposed = avg_log_likelihood(N_profile_proposed, qe_current, observed_qx,
+                                   n_bins, settings.n_individuals, settings.n_reps)
+
+  lpost_proposed = _eval_lpost(ll_proposed, N0_current, lam_proposed, qe_current,
+                               use_priors, qe_upper_bounds, settings)
+
+  if log(rand()) < (lpost_proposed - lpost_current)
+   lam_current = lam_proposed
+   N_profile_current = N_profile_proposed
+   ll_current = ll_proposed
+   lpost_current = lpost_proposed
+   n_accepted_lam += 1
+  end
+
+  # =====================================================================
+  # BLOCK 3: UPDATE q_e (one random bin)
+  # =====================================================================
+  qe_proposed = copy(qe_current)
+  bin_to_update = rand(1:n_bins)
+  qe_proposed[bin_to_update] += randn() * settings.proposal_sd_qe
+
+  ll_proposed = avg_log_likelihood(N_profile_current, qe_proposed, observed_qx,
+                                   n_bins, settings.n_individuals, settings.n_reps)
+
+  lpost_proposed = _eval_lpost(ll_proposed, N0_current, lam_current, qe_proposed,
+                               use_priors, qe_upper_bounds, settings)
+
+  if log(rand()) < (lpost_proposed - lpost_current)
+   qe_current = qe_proposed
+   ll_current = ll_proposed
+   lpost_current = lpost_proposed
+   n_accepted_qe += 1
+  end
+
+  # =====================================================================
+  # RECORD — burn-in OR post-burn-in              # CHECKPOINT: burn-in stored
+  # =====================================================================
+  if iter <= burn_in
+   burnin_N0[iter]    = N0_current
+   burnin_lam[iter]   = lam_current
+   burnin_qe[iter, :] = qe_current
+   burnin_ll[iter]    = lpost_current
+   burnin_filled = iter
+  else
+   idx = iter - burn_in
+   chain_N0[idx]    = N0_current
+   chain_lam[idx]   = lam_current
+   chain_qe[idx, :] = qe_current
+   chain_ll[idx]    = lpost_current
+   post_filled = idx
+  end
+
+  # =====================================================================
+  # CHECKPOINT + PROGRESS + ETA                   # CHECKPOINT: all new
+  # =====================================================================
+  if iter % checkpoint_interval == 0
+   batch_elapsed = time() - batch_start_time
+   total_elapsed = elapsed_prior + (time() - batch_start_time) +
+                   (batch_start_iter > 1 ? 0.0 : 0.0)
+   # More accurate: measure from the very start of this session
+   session_elapsed = time() - batch_start_time
+   iters_done_this_session = iter - batch_start_iter + 1
+   secs_per_iter = session_elapsed / iters_done_this_session
+   iters_remaining = settings.n_iterations - iter
+   eta_seconds = secs_per_iter * iters_remaining
+   eta_clock = Dates.format(now() + Second(round(Int, eta_seconds)),
+                            "HH:MM:SS")
+
+   # Save checkpoint
+   save_checkpoint(checkpoint_path;
+    iter = iter,
+    N0_current = N0_current,
+    lam_current = lam_current,
+    qe_current = qe_current,
+    lpost_current = lpost_current,
+    ll_current = ll_current,
+    burnin_N0 = burnin_N0,
+    burnin_lam = burnin_lam,
+    burnin_qe = burnin_qe,
+    burnin_ll = burnin_ll,
+    burnin_filled = burnin_filled,
+    chain_N0 = chain_N0,
+    chain_lam = chain_lam,
+    chain_qe = chain_qe,
+    chain_ll = chain_ll,
+    post_filled = post_filled,
+    n_accepted_N0 = n_accepted_N0,
+    n_accepted_lam = n_accepted_lam,
+    n_accepted_qe = n_accepted_qe,
+    label = label,
+    elapsed_seconds = elapsed_prior + session_elapsed
+   )
+
+   # Progress + ETA
+   @info @sprintf(
+    "[%s] iter %d/%d (%.1f%%) | N0=%.0f λ=%.4f | acc N0:%.1f%% λ:%.1f%% qe:%.1f%% | ETA: %s (%s)",
+    label, iter, settings.n_iterations,
+    100.0 * iter / settings.n_iterations,
+    N0_current, lam_current,
+    100 * n_accepted_N0 / iter,
+    100 * n_accepted_lam / iter,
+    100 * n_accepted_qe / iter,
+    format_eta(eta_seconds),
+    eta_clock
+   )
+  end
+ end
+
+ # -------------------------------------------------------------------------
+ # CLEANUP: delete checkpoint file — run completed successfully
+ # -------------------------------------------------------------------------
+ if isfile(checkpoint_path)
+  rm(checkpoint_path)
+  @info "Checkpoint file removed (run complete)" path=checkpoint_path
+ end
+
+ @info @sprintf(
+  "Model C DONE [%s] | N0 median=%.0f | λ median=%.4f | acc N0: %.1f%% | acc λ: %.1f%% | acc qe: %.1f%%",
+  label,
+  median(chain_N0), median(chain_lam),
+  100 * n_accepted_N0 / settings.n_iterations,
+  100 * n_accepted_lam / settings.n_iterations,
+  100 * n_accepted_qe / settings.n_iterations
+ )
+
+ # CHECKPOINT: return includes burn-in chains
+ return (
+  chain_N0 = chain_N0,
+  chain_lam = chain_lam,
+  chain_qe = chain_qe,
+  chain_ll = chain_ll,
+  burnin_N0 = burnin_N0,       # CHECKPOINT: new
+  burnin_lam = burnin_lam,     # CHECKPOINT: new
+  burnin_qe = burnin_qe,       # CHECKPOINT: new
+  burnin_ll = burnin_ll,       # CHECKPOINT: new
+  accept_rate_N0 = n_accepted_N0 / settings.n_iterations,
+  accept_rate_lam = n_accepted_lam / settings.n_iterations,
+  accept_rate_qe = n_accepted_qe / settings.n_iterations,
+  bin_midpoints = bin_midpoints,
+  label = label
+ )
+end
+
+
+
+
+# =============================================================================
+# PART 12: RECOVER q_i, t², AND DEATH COUNTS
+# =============================================================================
+# Samples from posterior, runs forward simulations, and returns:
+#   - qi_mean, qi_lower, qi_upper (per-bin intrinsic fraction)
+#   - t2_global, t2_per_bin
+#   - intrinsic_deaths, extrinsic_deaths, survivors (averaged across samples)
+#
+# The death counts are what the counterfactual script needs — no re-simulation.
+
+function recover_qi_and_t2(result; settings=SETTINGS, n_samples::Int=500)
+    @info "Recovering q_i and t²..." label=result.label
+
+    n_post     = length(result.chain_N0)
+    sample_idx = round.(Int, range(1, n_post, length=n_samples))
+    n_bins     = size(result.chain_qe, 2)
+
+    qi_matrix   = zeros(n_samples, n_bins)
+    t2_per_bin  = zeros(n_samples, n_bins)
+    t2_global   = zeros(n_samples)
+    
+    # NEW: Accumulate death counts across posterior samples
+    int_deaths_sum  = zeros(Float64, n_bins)
+    ext_deaths_sum  = zeros(Float64, n_bins)
+    survivors_sum   = zeros(Float64, n_bins)
+
+    for (s, idx) in enumerate(sample_idx)
+        N0_s  = result.chain_N0[idx]
+        lam_s = result.chain_lam[idx]
+        qe_s  = result.chain_qe[idx, :]
+
+        N_profile_s = compute_N_profile(N0_s, lam_s, result.bin_midpoints)
+        sim         = forward_simulation(N_profile_s, qe_s, n_bins, settings.n_individuals)
+
+        total_d = sim.intrinsic_deaths .+ sim.extrinsic_deaths
+        
+        # NEW: Accumulate raw counts
+        int_deaths_sum .+= sim.intrinsic_deaths
+        ext_deaths_sum .+= sim.extrinsic_deaths
+        survivors_sum  .+= sim.survivors
+
+        for bin in 1:n_bins
+            if total_d[bin] > 0
+                qi_matrix[s, bin]  = sim.intrinsic_deaths[bin] / total_d[bin]
+                t2_per_bin[s, bin] = sim.intrinsic_deaths[bin] / total_d[bin]
+            end
+        end
+
+        all_deaths   = sum(total_d)
+        t2_global[s] = all_deaths > 0 ? sum(sim.intrinsic_deaths) / all_deaths : 0.0
+    end
+
+    t2_med = median(t2_global)
+    t2_ci  = quantile(t2_global, [0.025, 0.975])
+
+    @info @sprintf("t² [%s] = %.3f (95%% CI: %.3f–%.3f)",
+                   result.label, t2_med, t2_ci[1], t2_ci[2])
+
+    # q_i monotonicity check
+    qi_mean = [mean(qi_matrix[:, b]) for b in 1:n_bins]
+    if all(qi_mean[k] <= qi_mean[k+1] for k in 1:(n_bins-1))
+        @info "✓ q_i increases monotonically"
+    else
+        @warn "✗ q_i NOT monotone — check model"
+    end
+    
+    # NEW: Average the accumulated counts
+    int_deaths_avg = int_deaths_sum ./ n_samples
+    ext_deaths_avg = ext_deaths_sum ./ n_samples
+    survivors_avg  = survivors_sum  ./ n_samples
+
+    return (
+        qi_mean          = qi_mean,
+        qi_lower         = [quantile(qi_matrix[:, b], 0.025) for b in 1:n_bins],
+        qi_upper         = [quantile(qi_matrix[:, b], 0.975) for b in 1:n_bins],
+        t2_global        = t2_med,
+        t2_global_ci     = t2_ci,
+        t2_per_bin       = [median(t2_per_bin[:, b]) for b in 1:n_bins],
+        t2_samples       = t2_global,
+        # NEW: Death counts for counterfactual
+        intrinsic_deaths = int_deaths_avg,
+        extrinsic_deaths = ext_deaths_avg,
+        survivors        = survivors_avg,
+        label            = result.label
+    )
+end
+
+# =============================================================================
+# PART 12b: SAVE COUNTERFACTUAL-READY DATA
+# =============================================================================
+# Saves pre-computed data from recover_qi_and_t2 — NO new simulation.
+
+function save_counterfactual_data(result, qi_t2, observed_lx;
+                                   output_dir=OUTPUT_ROOT)
+    
+    label_clean = replace(result.label, " " => "_")
+    n_bins      = size(result.chain_qe, 2)
+    
+    # Posterior medians
+    N0_med  = median(result.chain_N0)
+    lam_med = median(result.chain_lam)
+    qe_med  = [median(result.chain_qe[:, b]) for b in 1:n_bins]
+    
+    # Compute hazard rates from the already-computed death counts
+    h_i = zeros(Float64, n_bins)
+    h_e = zeros(Float64, n_bins)
+    for b in 1:n_bins
+        if qi_t2.survivors[b] > 0
+            h_i[b] = qi_t2.intrinsic_deaths[b] / qi_t2.survivors[b]
+            h_e[b] = qi_t2.extrinsic_deaths[b] / qi_t2.survivors[b]
+        end
+    end
+    
+    # Build DataFrame
+    df = DataFrame(
+        bin              = 1:n_bins,
+        bin_midpoint     = result.bin_midpoints,
+        intrinsic_deaths = qi_t2.intrinsic_deaths,
+        extrinsic_deaths = qi_t2.extrinsic_deaths,
+        survivors        = qi_t2.survivors,
+        h_i              = h_i,
+        h_e              = h_e,
+        observed_lx      = observed_lx,
+        qe_median        = qe_med
+    )
+    
+    data_path = joinpath(output_dir, "counterfactual_data_$(label_clean).csv")
+    CSV.write(data_path, df)
+    
+    # Metadata
+    meta_df = DataFrame(
+        N0_median   = [N0_med],
+        lam_median  = [lam_med],
+        t2_global   = [qi_t2.t2_global],
+        label       = [result.label]
+    )
+    meta_path = joinpath(output_dir, "counterfactual_meta_$(label_clean).csv")
+    CSV.write(meta_path, meta_df)
+    
+    @info "Saved counterfactual data" label=result.label path=data_path
+end
+# =============================================================================
+# PART 12: CONVERGENCE DIAGNOSTICS
+# =============================================================================
+# UNCHANGED from original
+
+function calc_ess(x::AbstractVector{<:Real})
+ n = length(x)
+ n < 10 && return Float64(n)
+ x_centered = x .- mean(x)
+ var_x = var(x)
+ var_x == 0.0 && return Float64(n)
+ max_lag = min(n - 1, 1000)
+ acf = zeros(max_lag)
+ for k in 1:max_lag
+ acf[k] = sum(x_centered[1:n-k] .* x_centered[k+1:n]) / ((n - k) * var_x)
+ end
+ tau = 0.0
+ for k in 1:2:(length(acf) - 1)
+ pair = acf[k] + acf[min(k + 1, length(acf))]
+ pair < 0.0 && break
+ tau += pair
+ end
+ return max(1.0, n / (1.0 + 2.0 * tau))
+end
+
+function calc_geweke(x::AbstractVector{<:Real}; frac1=0.1, frac2=0.5)
+ n = length(x)
+ n1 = floor(Int, n * frac1)
+ n2 = floor(Int, n * frac2)
+ early = x[1:n1]
+ late = x[(n - n2 + 1):n]
+ se = sqrt(var(early) / n1 + var(late) / n2)
+ se == 0.0 && return 0.0
+ return (mean(early) - mean(late)) / se
+end
+
+function run_diagnostics(result; settings=SETTINGS)
+ label = result.label
+ n_post = length(result.chain_N0)
+ n_bins = size(result.chain_qe, 2)
+
+ ess_N0 = calc_ess(result.chain_N0)
+ ess_lam = calc_ess(result.chain_lam)
+ ess_ll = calc_ess(result.chain_ll)
+ geweke_N0 = calc_geweke(result.chain_N0)
+ geweke_lam = calc_geweke(result.chain_lam)
+ ess_qe = [calc_ess(result.chain_qe[:, b]) for b in 1:n_bins]
+ geweke_qe = [calc_geweke(result.chain_qe[:, b]) for b in 1:n_bins]
+
+ println("\n" * "─" ^ 60)
+ println(" CONVERGENCE DIAGNOSTICS — $label")
+ println("─" ^ 60)
+ @printf(" Post burn-in samples: %d\n\n", n_post)
+
+ println(" ESS [target: > 200]")
+ @printf(" N₀ ESS = %.0f%s\n", ess_N0,
+ ess_N0 < 100 ? " ✗ LOW" : ess_N0 < 200 ? " ~ marginal" : " ✓")
+ @printf(" λ ESS = %.0f%s\n", ess_lam,
+ ess_lam < 100 ? " ✗ LOW" : ess_lam < 200 ? " ~ marginal" : " ✓")
+ @printf(" q_e bins ESS min/median/max = %.0f / %.0f / %.0f%s\n",
+ minimum(ess_qe), median(ess_qe), maximum(ess_qe),
+ minimum(ess_qe) < 100 ? " ✗ some bins LOW" : " ✓")
+ @printf(" log-posterior ESS = %.0f\n\n", ess_ll)
+
+ println(" GEWEKE [target: |z| < 2]")
+ @printf(" N₀ z = %+.2f%s\n", geweke_N0,
+ abs(geweke_N0) > 2 ? " ✗ NOT CONVERGED" : " ✓")
+ @printf(" λ z = %+.2f%s\n", geweke_lam,
+ abs(geweke_lam) > 2 ? " ✗ NOT CONVERGED" : " ✓")
+ n_bad_qe = sum(abs.(geweke_qe) .> 2)
+ @printf(" q_e bins %d / %d bins |z| > 2%s\n",
+ n_bad_qe, n_bins, n_bad_qe > 0 ? " ✗" : " ✓")
+
+ println()
+ all_ok = ess_N0 > 100 && ess_lam > 100 && minimum(ess_qe) > 100 &&
+ abs(geweke_N0) < 2 && abs(geweke_lam) < 2 && n_bad_qe == 0
+ all_ok ? println(" VERDICT: ✓ Chain converged") :
+ println(" VERDICT: ✗ Check traces before trusting science plots")
+ println("─" ^ 60)
+
+ return (ess_N0=ess_N0, ess_lam=ess_lam, ess_qe=ess_qe,
+ geweke_N0=geweke_N0, geweke_lam=geweke_lam, geweke_qe=geweke_qe)
+end
+
+
+# =============================================================================
+# PART 13: OUTPUT SAVING FUNCTIONS
+# =============================================================================
+# UNCHANGED — final CSV outputs are identical
+
+function save_chains(result; output_dir=OUTPUT_ROOT)
+ label_clean = replace(result.label, " " => "_")
+
+ df_scalar = DataFrame(
+ chain_N0 = result.chain_N0,
+ chain_lam = result.chain_lam,
+ chain_ll = result.chain_ll
+ )
+ CSV.write(joinpath(output_dir, "chains_scalar_$(label_clean).csv"), df_scalar)
+
+ n_bins = size(result.chain_qe, 2)
+ df_qe = DataFrame(result.chain_qe, ["qe_bin_$b" for b in 1:n_bins])
+ CSV.write(joinpath(output_dir, "chains_qe_$(label_clean).csv"), df_qe)
+
+ # CHECKPOINT: also save burn-in chains to separate files
+ if hasproperty(result, :burnin_N0)
+  df_burnin = DataFrame(
+   chain_N0 = result.burnin_N0,
+   chain_lam = result.burnin_lam,
+   chain_ll = result.burnin_ll
+  )
+  CSV.write(joinpath(output_dir, "chains_burnin_scalar_$(label_clean).csv"), df_burnin)
+
+  n_bins_b = size(result.burnin_qe, 2)
+  df_burnin_qe = DataFrame(result.burnin_qe, ["qe_bin_$b" for b in 1:n_bins_b])
+  CSV.write(joinpath(output_dir, "chains_burnin_qe_$(label_clean).csv"), df_burnin_qe)
+
+  @info "Saved burn-in chains" label=result.label
+ end
+
+ @info "Saved chains" label=result.label dir=output_dir
+end
+
+function save_posterior_summary(result, qi_t2; output_dir=OUTPUT_ROOT)
+ label_clean = replace(result.label, " " => "_")
+ n_bins = size(result.chain_qe, 2)
+
+ rows = []
+
+ for (name, chain) in [("N0", result.chain_N0), ("lambda", result.chain_lam)]
+ push!(rows, (
+  parameter = name,
+  bin = 0,
+  median = median(chain),
+  lo95 = quantile(chain, 0.025),
+  hi95 = quantile(chain, 0.975)
+ ))
+ end
+
+ for b in 1:n_bins
+ push!(rows, (
+  parameter = "qe",
+  bin = b,
+  median = median(result.chain_qe[:, b]),
+  lo95 = quantile(result.chain_qe[:, b], 0.025),
+  hi95 = quantile(result.chain_qe[:, b], 0.975)
+ ))
+ end
+
+ push!(rows, (
+ parameter = "t2_global",
+ bin = 0,
+ median = qi_t2.t2_global,
+ lo95 = quantile(qi_t2.t2_samples, 0.025),
+ hi95 = quantile(qi_t2.t2_samples, 0.975)
+ ))
+
+ for b in 1:n_bins
+ push!(rows, (
+  parameter = "t2_per_bin",
+  bin = b,
+  median = qi_t2.t2_per_bin[b],
+  lo95 = NaN,
+  hi95 = NaN
+ ))
+ end
+
+ df = DataFrame(rows)
+ path = joinpath(output_dir, "posterior_summary_$(label_clean).csv")
+ CSV.write(path, df)
+ @info "Saved posterior summary" label=result.label path=path
+end
+
+function compute_and_save_fit_stats(result, binned_data;
+ settings=SETTINGS, output_dir=OUTPUT_ROOT,
+ n_reps_fit=50)
+ label_clean = replace(result.label, " " => "_")
+ n_bins = settings.n_bins
+
+ N0_med = median(result.chain_N0)
+ lam_med = median(result.chain_lam)
+ qe_med = [median(result.chain_qe[:, b]) for b in 1:n_bins]
+
+ N_profile_med = compute_N_profile(N0_med, lam_med, result.bin_midpoints)
+
+ lx_reps = zeros(n_reps_fit, n_bins)
+ qx_reps = zeros(n_reps_fit, n_bins)
+ for r in 1:n_reps_fit
+ sim = forward_simulation(N_profile_med, qe_med, n_bins, settings.n_individuals)
+ lx_reps[r, :] = sim.predicted_lx
+ qx_reps[r, :] = sim.predicted_qx
+ end
+
+ pred_lx = vec(mean(lx_reps, dims=1))
+ pred_qx = vec(mean(qx_reps, dims=1))
+ obs_lx = binned_data.observed_lx
+ obs_qx = binned_data.observed_qx
+
+ sse_lx = sum((pred_lx .- obs_lx).^2)
+ rmse_lx = sqrt(sse_lx / n_bins)
+
+ log_pred_qx = log.(max.(pred_qx, 1e-10))
+ log_obs_qx = log.(max.(obs_qx, 1e-10))
+ sse_logqx = sum((log_pred_qx .- log_obs_qx).^2)
+ rmse_logqx = sqrt(sse_logqx / n_bins)
+
+ df_perbin = DataFrame(
+ bin = 1:n_bins,
+ obs_lx = obs_lx,
+ pred_lx = pred_lx,
+ residual_lx = pred_lx .- obs_lx,
+ obs_qx = obs_qx,
+ pred_qx = pred_qx,
+ residual_logqx = log_pred_qx .- log_obs_qx
+ )
+
+ df_summary = DataFrame(
+ label = [result.label],
+ sse_lx = [sse_lx],
+ rmse_lx = [rmse_lx],
+ sse_logqx = [sse_logqx],
+ rmse_logqx = [rmse_logqx],
+ mean_ll = [mean(result.chain_ll)]
+ )
+
+ CSV.write(joinpath(output_dir, "fit_perbin_$(label_clean).csv"), df_perbin)
+ CSV.write(joinpath(output_dir, "fit_summary_$(label_clean).csv"), df_summary)
+
+ @printf(" %-28s | RMSE(lx)=%.4f | SSE(lx)=%.5f | RMSE(log-qx)=%.4f\n",
+ result.label, rmse_lx, sse_lx, rmse_logqx)
+
+ @info "Saved fit stats" label=result.label rmse_lx=round(rmse_lx, digits=4)
+ return df_summary
+end
+
+
+# =============================================================================
+# PART 14: PLOTTING
+# =============================================================================
+
+const COL_JPN = RGBf(0.20, 0.55, 0.85)
+const COL_HADZA = RGBf(0.85, 0.40, 0.20)
+const COL_ACHE = RGBf(0.25, 0.70, 0.40)
+const COL_HG = RGBf(0.60, 0.20, 0.60)
+
+
+# CHECKPOINT: plot_diagnostics now shows burn-in in grey with a vertical
+# dividing line at the burn-in boundary, so you can visually confirm
+# the sampler found the typical set before the chain started recording.
+
+function plot_diagnostics(result; output_dir=OUTPUT_ROOT, settings=SETTINGS)
+ label = result.label
+ n_post = length(result.chain_N0)
+ burn_in = settings.burn_in
+
+ has_burnin = hasproperty(result, :burnin_N0) && length(result.burnin_N0) > 0
+
+ fig = Figure(size=(1400, 900), backgroundcolor=:white)
+
+ # --- N₀ trace ---
+ ax1 = Axis(fig[1,1], title="N₀ trace", xlabel="Iteration", ylabel="N₀", titlesize=14)
+ if has_burnin
+  burnin_iters = 1:burn_in
+  lines!(ax1, burnin_iters, result.burnin_N0,
+         color=(:gray60, 0.4), linewidth=0.3, label="burn-in")
+  vlines!(ax1, [burn_in], color=:red, linewidth=1.5, linestyle=:dash)
+ end
+ post_iters = (burn_in + 1):(burn_in + n_post)
+ lines!(ax1, post_iters, result.chain_N0,
+        color=COL_JPN, linewidth=0.5, alpha=0.7, label="post burn-in")
+ hlines!(ax1, [median(result.chain_N0)], color=:black, linewidth=1.5,
+         linestyle=:dash, label="median")
+ axislegend(ax1, position=:rt)
+
+ # --- λ trace ---
+ ax2 = Axis(fig[1,2], title="λ trace", xlabel="Iteration", ylabel="λ", titlesize=14)
+ if has_burnin
+  lines!(ax2, burnin_iters, result.burnin_lam,
+         color=(:gray60, 0.4), linewidth=0.3)
+  vlines!(ax2, [burn_in], color=:red, linewidth=1.5, linestyle=:dash)
+ end
+ lines!(ax2, post_iters, result.chain_lam,
+        color=COL_HADZA, linewidth=0.5, alpha=0.7)
+ hlines!(ax2, [median(result.chain_lam)], color=:black, linewidth=1.5,
+         linestyle=:dash, label="median")
+ axislegend(ax2, position=:rt)
+
+ # --- Log-posterior trace ---
+ ax3 = Axis(fig[2,1], title="Log-posterior trace", xlabel="Iteration",
+            ylabel="log-posterior", titlesize=14)
+ if has_burnin
+  lines!(ax3, burnin_iters, result.burnin_ll,
+         color=(:gray60, 0.4), linewidth=0.3)
+  vlines!(ax3, [burn_in], color=:red, linewidth=1.5, linestyle=:dash)
+ end
+ lines!(ax3, post_iters, result.chain_ll,
+        color=:gray40, linewidth=0.5, alpha=0.8)
+
+ # --- Acceptance rates ---
+ ax4 = Axis(fig[2,2],
+ title="Acceptance rates (target: 25–35%)",
+ ylabel="Acceptance rate (%)", titlesize=14,
+ xticks=(1:3, ["N₀", "λ", "qₑ"]))
+ rates = [result.accept_rate_N0, result.accept_rate_lam, result.accept_rate_qe] .* 100
+ barplot!(ax4, 1:3, rates, color=[COL_JPN, COL_HADZA, COL_ACHE])
+ hlines!(ax4, [25.0, 35.0], color=:black, linewidth=1.2, linestyle=:dash)
+ ylims!(ax4, 0, 100)
+
+ Label(fig[0, :], "MCMC Diagnostics — $label", fontsize=18, font=:bold)
+
+ path = joinpath(output_dir, "diagnostics_$(replace(label, " "=>"_")).pdf")
+ save(path, fig)
+ @info "Saved diagnostics" path=path
+end
+
+
+function plot_lx_fit(result_jpn, result_hadza, result_ache,
+ jpn_b, hadza_b, ache_b;
+ settings=SETTINGS, output_dir=OUTPUT_ROOT)
+
+ fig = Figure(size=(1100, 500), backgroundcolor=:white)
+ ax = Axis(fig[1,1],
+ title="Predicted vs Observed Survivorship (lₓ)",
+ xlabel="Age bin (proportional, 1=youngest, 11=oldest)",
+ ylabel="lₓ", titlesize=15)
+
+ bin_x = 1:settings.n_bins
+
+ for (result, binned, col, lab) in [
+ (result_jpn, jpn_b, COL_JPN, "Japan 2010"),
+ (result_hadza, hadza_b, COL_HADZA, "Hadza"),
+ (result_ache, ache_b, COL_ACHE, "Ache")]
+
+ lines!(ax, bin_x, binned.observed_lx, color=col, linewidth=2.5, label="$lab observed")
+ scatter!(ax, bin_x, binned.observed_lx, color=col, markersize=7)
+
+ n_pred = 200
+ n_post = length(result.chain_N0)
+ idx_s = round.(Int, range(1, n_post, length=n_pred))
+ lx_mat = zeros(n_pred, settings.n_bins)
+
+ for (s, idx) in enumerate(idx_s)
+  N0_s = result.chain_N0[idx]
+  lam_s = result.chain_lam[idx]
+  qe_s = result.chain_qe[idx, :]
+  Np_s = compute_N_profile(N0_s, lam_s, result.bin_midpoints)
+  sim = forward_simulation(Np_s, qe_s, settings.n_bins, settings.n_individuals)
+  lx_mat[s, :] = sim.predicted_lx
+ end
+
+ lx_pred_mean = [mean(lx_mat[:, b]) for b in 1:settings.n_bins]
+ lx_pred_lower = [quantile(lx_mat[:, b], 0.025) for b in 1:settings.n_bins]
+ lx_pred_upper = [quantile(lx_mat[:, b], 0.975) for b in 1:settings.n_bins]
+
+ band!(ax, bin_x, lx_pred_lower, lx_pred_upper, color=(col, 0.15))
+ lines!(ax, bin_x, lx_pred_mean, color=col, linewidth=2.0, linestyle=:dash,
+  label="$lab predicted")
+ end
+
+ axislegend(ax, position=:lb)
+ ylims!(ax, 0, 1.05)
+ path = joinpath(output_dir, "lx_fit_comparison.pdf")
+ save(path, fig)
+ @info "Saved lx fit" path=path
+end
+
+
+function plot_science(result_jpn, result_hadza, result_ache,
+ qi_t2_jpn, qi_t2_hadza, qi_t2_ache;
+ settings=SETTINGS, output_dir=OUTPUT_ROOT)
+
+ n_bins = settings.n_bins
+ bin_x = 1:n_bins
+ fig = Figure(size=(1200, 1000), backgroundcolor=:white)
+
+ ax1 = Axis(fig[1,1], title="Posterior q_e — Extrinsic threshold by age",
+ xlabel="Age bin", ylabel="q_e", titlesize=13)
+
+ qe_hadza_med = [median(result_hadza.chain_qe[:, b]) for b in 1:n_bins]
+ qe_ache_med = [median(result_ache.chain_qe[:, b]) for b in 1:n_bins]
+ qe_jpn_med = [median(result_jpn.chain_qe[:, b]) for b in 1:n_bins]
+ qe_hg_avg = (qe_hadza_med .+ qe_ache_med) ./ 2
+
+ for (med, lo_fn, hi_fn, col, lab) in [
+ (qe_hadza_med, b->quantile(result_hadza.chain_qe[:,b],0.025),
+  b->quantile(result_hadza.chain_qe[:,b],0.975), COL_HADZA, "Hadza"),
+ (qe_ache_med, b->quantile(result_ache.chain_qe[:,b],0.025),
+  b->quantile(result_ache.chain_qe[:,b],0.975), COL_ACHE, "Ache"),
+ (qe_jpn_med, b->quantile(result_jpn.chain_qe[:,b],0.025),
+  b->quantile(result_jpn.chain_qe[:,b],0.975), COL_JPN, "Japan 2010")]
+ lo = [lo_fn(b) for b in 1:n_bins]
+ hi = [hi_fn(b) for b in 1:n_bins]
+ band!(ax1, bin_x, lo, hi, color=(col, 0.15))
+ lines!(ax1, bin_x, med, color=col, linewidth=2.0, label=lab)
+ end
+ lines!(ax1, bin_x, qe_hg_avg, color=COL_HG, linewidth=2.5, linestyle=:dash, label="HG average")
+ axislegend(ax1, position=:rt)
+
+ ax2 = Axis(fig[1,2], title="Recovered q_i — Intrinsic death fraction by age",
+ xlabel="Age bin", ylabel="Intrinsic fraction of deaths", titlesize=13)
+ for (qi_t2, col, lab) in [(qi_t2_jpn, COL_JPN, "Japan 2010"),
+ (qi_t2_hadza, COL_HADZA, "Hadza"),
+ (qi_t2_ache, COL_ACHE, "Ache")]
+ band!(ax2, bin_x, qi_t2.qi_lower, qi_t2.qi_upper, color=(col, 0.15))
+ lines!(ax2, bin_x, qi_t2.qi_mean, color=col, linewidth=2.5, label=lab)
+ end
+ axislegend(ax2, position=:lt)
+
+ ax3 = Axis(fig[2,1], title="t² by age bin — intrinsic fraction of mortality",
+ xlabel="Age bin", ylabel="t²", titlesize=13)
+ for (qi_t2, col, lab) in [(qi_t2_jpn, COL_JPN, "Japan 2010"),
+ (qi_t2_hadza, COL_HADZA, "Hadza"),
+ (qi_t2_ache, COL_ACHE, "Ache")]
+ lines!(ax3, bin_x, qi_t2.t2_per_bin, color=col, linewidth=2.5, label=lab)
+ scatter!(ax3, bin_x, qi_t2.t2_per_bin, color=col, markersize=6)
+ end
+ hlines!(ax3, [0.5], color=:gray, linewidth=1.0, linestyle=:dash)
+ ylims!(ax3, 0, 1.05)
+ axislegend(ax3, position=:lt)
+
+ ax4 = Axis(fig[2,2], title="Global t² posterior — intrinsic fraction of all deaths",
+ xlabel="t²", ylabel="Density", titlesize=13)
+ for (qi_t2, col, lab) in [(qi_t2_jpn, COL_JPN, "Japan 2010"),
+ (qi_t2_hadza, COL_HADZA, "Hadza"),
+ (qi_t2_ache, COL_ACHE, "Ache")]
+ density!(ax4, qi_t2.t2_samples, color=(col, 0.3), strokecolor=col, strokewidth=2.0,
+  label=@sprintf("%s t²=%.2f", lab, qi_t2.t2_global))
+ end
+ xlims!(ax4, 0, 1)
+ axislegend(ax4, position=:rt)
+
+ Label(fig[0, :], "Model C — Scientific Output Plots", fontsize=18, font=:bold)
+
+ path = joinpath(output_dir, "science_plots.pdf")
+ save(path, fig)
+ @info "Saved science plots" path=path
+end
+
+
+# NO-PRIORS CHANGE 4: prior sensitivity comparison plot
+const COL_WITH = RGBf(0.20, 0.55, 0.85)
+const COL_WITHOUT = RGBf(0.85, 0.40, 0.20)
+
+function plot_prior_sensitivity(result_with_priors, result_no_priors,
+ qi_t2_with, qi_t2_without;
+ pop_label="JPN 2010",
+ output_dir=OUTPUT_ROOT, settings=SETTINGS)
+
+ n_bins = settings.n_bins
+ bin_x = 1:n_bins
+
+ fig = Figure(size=(1200, 800), backgroundcolor=:white)
+
+ ax1 = Axis(fig[1,1], title="N₀ posterior — prior sensitivity",
+ xlabel="N₀", ylabel="Density", titlesize=13)
+ density!(ax1, result_with_priors.chain_N0,
+ color=(COL_WITH, 0.3), strokecolor=COL_WITH, strokewidth=2,
+ label="With priors")
+ density!(ax1, result_no_priors.chain_N0,
+ color=(COL_WITHOUT, 0.3), strokecolor=COL_WITHOUT, strokewidth=2,
+ label="No priors (likelihood only)")
+ axislegend(ax1, position=:rt)
+
+ ax2 = Axis(fig[1,2], title="λ posterior — prior sensitivity",
+ xlabel="λ", ylabel="Density", titlesize=13)
+ density!(ax2, result_with_priors.chain_lam,
+ color=(COL_WITH, 0.3), strokecolor=COL_WITH, strokewidth=2,
+ label="With priors")
+ density!(ax2, result_no_priors.chain_lam,
+ color=(COL_WITHOUT, 0.3), strokecolor=COL_WITHOUT, strokewidth=2,
+ label="No priors (likelihood only)")
+ axislegend(ax2, position=:rt)
+
+ ax3 = Axis(fig[2,1], title="q_e profile — prior sensitivity",
+ xlabel="Age bin", ylabel="q_e", titlesize=13)
+ qe_with = [median(result_with_priors.chain_qe[:, b]) for b in 1:n_bins]
+ qe_without = [median(result_no_priors.chain_qe[:, b]) for b in 1:n_bins]
+ qe_with_lo = [quantile(result_with_priors.chain_qe[:, b], 0.025) for b in 1:n_bins]
+ qe_with_hi = [quantile(result_with_priors.chain_qe[:, b], 0.975) for b in 1:n_bins]
+ qe_without_lo = [quantile(result_no_priors.chain_qe[:, b], 0.025) for b in 1:n_bins]
+ qe_without_hi = [quantile(result_no_priors.chain_qe[:, b], 0.975) for b in 1:n_bins]
+ band!(ax3, bin_x, qe_with_lo, qe_with_hi, color=(COL_WITH, 0.15))
+ band!(ax3, bin_x, qe_without_lo, qe_without_hi, color=(COL_WITHOUT, 0.15))
+ lines!(ax3, bin_x, qe_with, color=COL_WITH, linewidth=2.5, label="With priors")
+ lines!(ax3, bin_x, qe_without, color=COL_WITHOUT, linewidth=2.5, label="No priors")
+ axislegend(ax3, position=:rt)
+
+ ax4 = Axis(fig[2,2], title="Global t² posterior — prior sensitivity",
+ xlabel="t²", ylabel="Density", titlesize=13)
+ density!(ax4, qi_t2_with.t2_samples,
+ color=(COL_WITH, 0.3), strokecolor=COL_WITH, strokewidth=2,
+ label=@sprintf("With priors t²=%.3f", qi_t2_with.t2_global))
+ density!(ax4, qi_t2_without.t2_samples,
+ color=(COL_WITHOUT, 0.3), strokecolor=COL_WITHOUT, strokewidth=2,
+ label=@sprintf("No priors t²=%.3f", qi_t2_without.t2_global))
+ xlims!(ax4, 0, 1)
+ axislegend(ax4, position=:rt)
+
+ Label(fig[0, :], "Prior sensitivity analysis — $pop_label", fontsize=18, font=:bold)
+
+ path = joinpath(output_dir, "prior_sensitivity_$(replace(pop_label, " "=>"_")).pdf")
+ save(path, fig)
+ @info "Saved prior sensitivity plot" path=path
+end
+
+
+# =============================================================================
+# PART 15: MAIN — with stage-aware resume
+# =============================================================================
+# CHECKPOINT: main() now checks stage_status.jld2 before each population.
+# If a stage is already complete, it loads the saved results from CSV
+# instead of re-running. This means:
+#   - Crash during Ache? Hadza is skipped on restart.
+#   - Crash during Japan? Both HG populations skipped, ceiling loaded from status.
+#   - Crash during no-prior Japan? All prior runs skipped.
+
+function main()
+ println("=" ^ 70)
+ println(" MODEL C REVISED — Joint Estimation (N_0, λ, q_e) | qx likelihood")
+ println(" WITH CHECKPOINTING + RESUME")
+ println(" $(Dates.format(now(), "yyyy-mm-dd HH:MM"))")
+ println("=" ^ 70)
+
+ mkpath(OUTPUT_ROOT)
+
+ # =========================================================================
+ # LOAD & BIN
+ # =========================================================================
+ println("\nLoading populations...")
+ jpn = load_pipeline_population("JPN", 2010)
+ hadza = load_hadza()
+ ache = load_ache()
+
+ println("\nBinning into $(SETTINGS.n_bins) proportional bins...")
+ n_bins = SETTINGS.n_bins
+ jpn_b = bin_proportional(jpn.ages, jpn.lx, n_bins)
+ hadza_b = bin_proportional(hadza.ages, hadza.lx, n_bins)
+ ache_b = bin_proportional(ache.ages, ache.lx, n_bins)
+
+ println("\nActive threads: $(Threads.nthreads())")
+
+ # =========================================================================
+ # STAGE 1: Hadza                                    # CHECKPOINT: stage-aware
+ # =========================================================================
+ if is_stage_complete(OUTPUT_ROOT, "Hadza")
+  println("\n[1/4] Hadza — ALREADY COMPLETE, loading from CSV...")
+  result_hadza = _reload_result("Hadza", n_bins, hadza_b.bin_midpoints)
+ else
+  println("\n[1/4] Hadza (full priors)...")
+  result_hadza = run_model_C(hadza_b.observed_qx, hadza_b.bin_midpoints, n_bins,
+   label="Hadza")
+ end
+
+ # =========================================================================
+ # STAGE 2: Ache                                     # CHECKPOINT: stage-aware
+ # =========================================================================
+ if is_stage_complete(OUTPUT_ROOT, "Ache")
+  println("\n[2/4] Ache — ALREADY COMPLETE, loading from CSV...")
+  result_ache = _reload_result("Ache", n_bins, ache_b.bin_midpoints)
+ else
+  println("\n[2/4] Ache (full priors)...")
+  result_ache = run_model_C(ache_b.observed_qx, ache_b.bin_midpoints, n_bins,
+   label="Ache")
+ end
+
+ # =========================================================================
+ # STAGE 3: Japan — full priors + soft HG ceiling    # CHECKPOINT: stage-aware
+ # =========================================================================
+ # Build ceiling from HG results (whether fresh or reloaded)
+ hg_qe_ceiling = [(median(result_hadza.chain_qe[:, b]) +
+  median(result_ache.chain_qe[:, b])) / 2.0
+  for b in 1:n_bins]
+
+ @info "HG q_e ceiling for Japan" ceiling=round.(hg_qe_ceiling, digits=3)
+
+ if is_stage_complete(OUTPUT_ROOT, "JPN_2010")
+  println("\n[3/4] Japan 2010 — ALREADY COMPLETE, loading from CSV...")
+  result_jpn = _reload_result("JPN_2010", n_bins, jpn_b.bin_midpoints)
+ else
+  println("\n[3/4] Japan 2010 (full priors + soft HG ceiling)...")
+  result_jpn = run_model_C(jpn_b.observed_qx, jpn_b.bin_midpoints, n_bins,
+   label="JPN 2010",
+   qe_upper_bounds=hg_qe_ceiling)
+ end
+
+ # =========================================================================
+ # DERIVED QUANTITIES, DIAGNOSTICS, SAVING — with stage markers
+ # =========================================================================
+ println("\nRecovering q_i and t²...")
+ qi_t2_hadza = recover_qi_and_t2(result_hadza)
+ qi_t2_ache = recover_qi_and_t2(result_ache)
+ qi_t2_jpn = recover_qi_and_t2(result_jpn)
+
+ # --- SAVE COUNTERFACTUAL DATA ---
+    println("\nSaving counterfactual-ready data...")
+    save_counterfactual_data(result_hadza, qi_t2_hadza, hadza_b.observed_lx)
+    save_counterfactual_data(result_ache,  qi_t2_ache,  ache_b.observed_lx)
+    save_counterfactual_data(result_jpn,   qi_t2_jpn,   jpn_b.observed_lx)
+
+ println("\nConvergence diagnostics...")
+ run_diagnostics(result_hadza)
+ run_diagnostics(result_ache)
+ run_diagnostics(result_jpn)
+
+ println("\nSaving chains (feeds MLE script)...")
+ save_chains(result_hadza)
+ save_chains(result_ache)
+ save_chains(result_jpn)
+
+ println("\nSaving posterior summaries...")
+ save_posterior_summary(result_hadza, qi_t2_hadza)
+ save_posterior_summary(result_ache, qi_t2_ache)
+ save_posterior_summary(result_jpn, qi_t2_jpn)
+
+ println("\nFit statistics — full prior runs:")
+ println(" " * "─" ^ 62)
+ compute_and_save_fit_stats(result_hadza, hadza_b)
+ compute_and_save_fit_stats(result_ache, ache_b)
+ compute_and_save_fit_stats(result_jpn, jpn_b)
+
+ # CHECKPOINT: mark stages complete so they're skipped on restart
+ save_stage_status(OUTPUT_ROOT, "Hadza", result_hadza, qi_t2_hadza)
+ save_stage_status(OUTPUT_ROOT, "Ache", result_ache, qi_t2_ache)
+ save_stage_status(OUTPUT_ROOT, "JPN_2010", result_jpn, qi_t2_jpn)
+
+ # =========================================================================
+ # STAGE 4: No-priors sensitivity — Japan             # CHECKPOINT: stage-aware
+ # =========================================================================
+ println("\n" * "=" ^ 70)
+ println(" SENSITIVITY: Japan 2010 — likelihood only (no priors)")
+ println("=" ^ 70)
+
+ if is_stage_complete(OUTPUT_ROOT, "JPN_2010_(no_priors)")
+  println("\n[4/4] Japan no-priors — ALREADY COMPLETE, loading from CSV...")
+  result_jpn_noprior = _reload_result("JPN_2010_(no_priors)", n_bins, jpn_b.bin_midpoints)
+ else
+  result_jpn_noprior = run_model_C(jpn_b.observed_qx, jpn_b.bin_midpoints, n_bins,
+   label="JPN 2010 (no priors)",
+   qe_upper_bounds=nothing,
+   use_priors=false)
+ end
+
+ qi_t2_jpn_noprior = recover_qi_and_t2(result_jpn_noprior)
+
+ run_diagnostics(result_jpn_noprior)
+
+ println("\nSaving no-prior chains (feeds MLE script)...")
+ save_chains(result_jpn_noprior)
+ save_posterior_summary(result_jpn_noprior, qi_t2_jpn_noprior)
+
+ println("\nFit statistics — no-prior Japan run:")
+ println(" " * "─" ^ 62)
+ compute_and_save_fit_stats(result_jpn_noprior, jpn_b)
+
+ save_stage_status(OUTPUT_ROOT, "JPN_2010_(no_priors)", result_jpn_noprior, qi_t2_jpn_noprior)
+
+ # =========================================================================
+ # SUMMARY TABLE
+ # =========================================================================
+ println("\n" * "=" ^ 70)
+ println(" POSTERIOR SUMMARY — ALL RUNS")
+ println("=" ^ 70)
+ @printf(" %-24s %8s %8s %8s %8s %8s %6s\n",
+ "Population", "N0 med", "λ med", "acc N0", "acc λ", "acc qe", "t²")
+ println(" " * "─" ^ 70)
+ for (label, res, qt) in [
+ ("JPN 2010 (priors)", result_jpn, qi_t2_jpn),
+ ("JPN 2010 (no priors)", result_jpn_noprior, qi_t2_jpn_noprior),
+ ("Hadza", result_hadza, qi_t2_hadza),
+ ("Ache", result_ache, qi_t2_ache)]
+ @printf(" %-24s %8.0f %8.4f %7.1f%% %7.1f%% %7.1f%% %6.3f\n",
+  label,
+  median(res.chain_N0),
+  median(res.chain_lam),
+  100 * res.accept_rate_N0,
+  100 * res.accept_rate_lam,
+  100 * res.accept_rate_qe,
+  qt.t2_global)
+ end
+
+ delta_t2 = qi_t2_jpn_noprior.t2_global - qi_t2_jpn.t2_global
+ @printf("\n Δt² (no priors − with priors) = %+.3f\n", delta_t2)
+ abs(delta_t2) < 0.05 ?
+ println(" → Priors have minimal effect on t². Result is data-driven. ✓") :
+ println(" → Priors are shifting t² noticeably. Report which prior is load-bearing.")
+
+ # =========================================================================
+ # PLOTS
+ # =========================================================================
+ println("\nGenerating plots...")
+ plot_diagnostics(result_hadza)
+ plot_diagnostics(result_ache)
+ plot_diagnostics(result_jpn)
+ plot_diagnostics(result_jpn_noprior)
+ plot_lx_fit(result_jpn, result_hadza, result_ache, jpn_b, hadza_b, ache_b)
+ plot_science(result_jpn, result_hadza, result_ache, qi_t2_jpn, qi_t2_hadza, qi_t2_ache)
+
+ plot_prior_sensitivity(result_jpn, result_jpn_noprior,
+ qi_t2_jpn, qi_t2_jpn_noprior,
+ pop_label="JPN 2010")
+
+ println("\nAll outputs saved to $OUTPUT_ROOT")
+ println("Done.")
+
+ return (jpn = result_jpn,
+ jpn_noprior = result_jpn_noprior,
+ hadza = result_hadza,
+ ache = result_ache,
+ qi_t2_jpn = qi_t2_jpn,
+ qi_t2_noprior = qi_t2_jpn_noprior,
+ qi_t2_hadza = qi_t2_hadza,
+ qi_t2_ache = qi_t2_ache)
+end
+
+
+# =============================================================================
+# HELPER: reload a completed run's chains from CSV
+# =============================================================================
+# CHECKPOINT: When a stage is already complete, we don't re-run the MCMC.
+# Instead we read back the CSV files that were saved on the previous run.
+# This gives us the same NamedTuple shape that run_model_C returns,
+# so all downstream code (diagnostics, plots, t²) works unchanged.
+
+function _reload_result(label_clean::String, n_bins::Int, bin_midpoints::Vector{Float64})
+ scalar_path = joinpath(OUTPUT_ROOT, "chains_scalar_$(label_clean).csv")
+ qe_path     = joinpath(OUTPUT_ROOT, "chains_qe_$(label_clean).csv")
+
+ df_s = CSV.read(scalar_path, DataFrame)
+ df_q = CSV.read(qe_path, DataFrame)
+
+ chain_N0  = df_s.chain_N0
+ chain_lam = df_s.chain_lam
+ chain_ll  = df_s.chain_ll
+ chain_qe  = Matrix(df_q)
+
+ # Try to load burn-in chains if they exist
+ burnin_scalar_path = joinpath(OUTPUT_ROOT, "chains_burnin_scalar_$(label_clean).csv")
+ burnin_qe_path     = joinpath(OUTPUT_ROOT, "chains_burnin_qe_$(label_clean).csv")
+
+ if isfile(burnin_scalar_path) && isfile(burnin_qe_path)
+  df_bs = CSV.read(burnin_scalar_path, DataFrame)
+  df_bq = CSV.read(burnin_qe_path, DataFrame)
+  burnin_N0  = df_bs.chain_N0
+  burnin_lam = df_bs.chain_lam
+  burnin_ll  = df_bs.chain_ll
+  burnin_qe  = Matrix(df_bq)
+ else
+  # No burn-in files from previous run — use empty arrays
+  burnin_N0  = Float64[]
+  burnin_lam = Float64[]
+  burnin_ll  = Float64[]
+  burnin_qe  = zeros(Float64, 0, n_bins)
+ end
+
+ # Acceptance rates not stored in CSV — mark as NaN (won't affect science)
+ n_post = length(chain_N0)
+ @info "Reloaded from CSV" label=label_clean n_samples=n_post
+
+ return (
+  chain_N0 = chain_N0,
+  chain_lam = chain_lam,
+  chain_qe = chain_qe,
+  chain_ll = chain_ll,
+  burnin_N0 = burnin_N0,
+  burnin_lam = burnin_lam,
+  burnin_qe = burnin_qe,
+  burnin_ll = burnin_ll,
+  accept_rate_N0 = NaN,
+  accept_rate_lam = NaN,
+  accept_rate_qe = NaN,
+  bin_midpoints = bin_midpoints,
+  label = label_clean
+ )
+end
+
+
+results = main()
